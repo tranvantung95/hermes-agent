@@ -181,6 +181,12 @@ TOOLSETS = {
         "includes": []
     },
 
+    "facebook": {
+        "description": "Facebook Page publishing and Telegram approval workflow tools",
+        "tools": ["facebook_post", "facebook_create_review", "facebook_review_action"],
+        "includes": ["web", "messaging"]
+    },
+
     
     "file": {
         "description": "File manipulation tools: read, write, patch (with fuzzy matching), and search (content + files)",

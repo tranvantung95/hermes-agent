@@ -2377,6 +2377,77 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.warning("[%s] send_update_prompt failed: %s", self.name, e)
             return SendResult(success=False, error=str(e))
 
+    async def send_facebook_review(
+        self,
+        chat_id: str,
+        content: str,
+        review_id: str,
+        media_path: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send a Facebook draft review with inline approve/cancel buttons."""
+        if not self._bot:
+            return SendResult(success=False, error="Not connected")
+        try:
+            from tools.facebook_pipeline_tool import build_review_keyboard
+
+            keyboard_data = build_review_keyboard(review_id)
+            keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(button["text"], callback_data=button["callback_data"])
+                    for button in row
+                ]
+                for row in keyboard_data["inline_keyboard"]
+            ])
+            thread_id = self._metadata_thread_id(metadata)
+            reply_to_id = self._reply_to_message_id_for_send(None, metadata)
+            thread_kwargs = self._thread_kwargs_for_send(
+                chat_id,
+                thread_id,
+                metadata,
+                reply_to_message_id=reply_to_id,
+            )
+            text = content.replace("\n\nMEDIA:" + str(media_path), "") if media_path else content
+            ext = os.path.splitext(media_path or "")[1].lower()
+            media_sent = False
+            media_caption = f"Media đề xuất cho bài Facebook\nFile: {os.path.basename(media_path or '')}"[:1024]
+            if media_path and os.path.exists(media_path) and ext in {".jpg", ".jpeg", ".png", ".webp"}:
+                with open(media_path, "rb") as fh:
+                    await self._bot.send_photo(
+                        chat_id=int(chat_id),
+                        photo=fh,
+                        caption=media_caption,
+                        parse_mode=None,
+                        reply_to_message_id=reply_to_id,
+                        **thread_kwargs,
+                    )
+                media_sent = True
+            elif media_path and os.path.exists(media_path) and ext in {".mp4", ".mov", ".avi"}:
+                with open(media_path, "rb") as fh:
+                    await self._bot.send_video(
+                        chat_id=int(chat_id),
+                        video=fh,
+                        caption=media_caption,
+                        parse_mode=None,
+                        reply_to_message_id=reply_to_id,
+                        **thread_kwargs,
+                    )
+                media_sent = True
+
+            msg = await self._send_message_with_thread_fallback(
+                chat_id=int(chat_id),
+                text=text[: self.MAX_MESSAGE_LENGTH],
+                parse_mode=None,
+                reply_markup=keyboard,
+                reply_to_message_id=reply_to_id if not media_sent else None,
+                **thread_kwargs,
+                **self._link_preview_kwargs(),
+            )
+            return SendResult(success=True, message_id=str(msg.message_id))
+        except Exception as e:
+            logger.warning("[%s] send_facebook_review failed: %s", self.name, e, exc_info=True)
+            return SendResult(success=False, error=str(e))
+
     async def send_exec_approval(
         self, chat_id: str, command: str, session_key: str,
         description: str = "dangerous command",
@@ -3199,6 +3270,74 @@ class TelegramAdapter(BasePlatformAdapter):
                         "Telegram clarify button: resolve_gateway_clarify returned False (id=%s)",
                         clarify_id,
                     )
+            return
+
+        # --- Facebook post review callbacks (fbp:a:<id>:<n> | fbp:c:<id> | fbp:m:<id>) ---
+        if data.startswith("fbp:"):
+            caller_id = str(getattr(query.from_user, "id", ""))
+            if not self._is_callback_user_authorized(
+                caller_id,
+                chat_id=query_chat_id,
+                chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                user_name=query_user_name,
+            ):
+                await query.answer(text="⛔ Bạn không có quyền duyệt bài này.")
+                return
+            try:
+                from tools.facebook_pipeline_tool import (
+                    load_review_record,
+                    parse_review_callback_data,
+                    resolve_review_action,
+                )
+                parsed = parse_review_callback_data(data)
+                if not parsed:
+                    await query.answer(text="Dữ liệu nút không hợp lệ.")
+                    return
+                if parsed["action"] == "media":
+                    record = load_review_record(parsed["review_id"])
+                    media = record.get("selected_media") or {}
+                    filename = media.get("filename") or "không có media"
+                    await query.answer(text=f"Media: {filename}", show_alert=True)
+                    return
+                result = await resolve_review_action(
+                    parsed["review_id"],
+                    parsed["action"],
+                    draft_index=parsed.get("draft_index"),
+                )
+                if result.get("success"):
+                    status = result.get("status")
+                    if status == "published":
+                        text = "✅ Đã đăng Facebook."
+                    elif status == "already_published":
+                        text = "✅ Bài này đã được đăng trước đó."
+                    elif status == "cancelled":
+                        text = "❌ Đã hủy bài chờ duyệt."
+                    else:
+                        text = f"✓ {status}"
+                    await query.answer(text=text[:200])
+                    try:
+                        await query.edit_message_reply_markup(reply_markup=None)
+                    except Exception:
+                        pass
+                    if query.message:
+                        await self._send_message_with_thread_fallback(
+                            chat_id=int(query.message.chat_id),
+                            text=text,
+                            parse_mode=None,
+                            reply_to_message_id=getattr(query.message, "message_id", None),
+                            **self._thread_kwargs_for_send(
+                                str(query.message.chat_id),
+                                str(query_thread_id) if query_thread_id is not None else None,
+                                {"thread_id": str(query_thread_id)} if query_thread_id is not None else None,
+                                reply_to_message_id=getattr(query.message, "message_id", None),
+                            ),
+                        )
+                else:
+                    await query.answer(text=(result.get("error") or "Không xử lý được nút.")[:200], show_alert=True)
+            except Exception as exc:
+                logger.error("[%s] Facebook review callback failed: %s", self.name, exc, exc_info=True)
+                await query.answer(text=f"Lỗi xử lý Facebook review: {exc}"[:200], show_alert=True)
             return
 
         # --- Update prompt callbacks ---

@@ -51,6 +51,49 @@ from gateway.platforms.telegram import TelegramAdapter
 from gateway.config import Platform, PlatformConfig
 
 
+@pytest.mark.asyncio
+async def test_facebook_review_with_media_sends_media_then_full_text_with_buttons(tmp_path):
+    """Facebook review media must not truncate the three draft options into a 1024-char caption."""
+    adapter = _make_adapter()
+    image = tmp_path / "plant.jpg"
+    image.write_bytes(b"fake-jpg")
+    photo_msg = SimpleNamespace(message_id=41)
+    review_msg = SimpleNamespace(message_id=42)
+    adapter._bot.send_photo = AsyncMock(return_value=photo_msg)
+    adapter._send_message_with_thread_fallback = AsyncMock(return_value=review_msg)
+
+    content = (
+        "## Bài Facebook chờ duyệt\n\n"
+        "**Media đề xuất:**\nplant.jpg\n\n"
+        "**Bản 1:**\n" + ("A" * 900) + "\n\n"
+        "**Bản 2:**\n" + ("B" * 900) + "\n\n"
+        "**Bản 3:**\n" + ("C" * 900) + "\n\n"
+        "Bấm nút bên dưới để duyệt/đăng."
+    )
+
+    result = await adapter.send_facebook_review(
+        chat_id="12345",
+        content=content,
+        review_id="20260519-abc123",
+        media_path=str(image),
+    )
+
+    assert result.success is True
+    assert result.message_id == "42"
+    adapter._bot.send_photo.assert_awaited_once()
+    photo_kwargs = adapter._bot.send_photo.call_args.kwargs
+    assert "reply_markup" not in photo_kwargs or photo_kwargs["reply_markup"] is None
+    assert "Bản 2" not in (photo_kwargs.get("caption") or "")
+
+    adapter._send_message_with_thread_fallback.assert_awaited_once()
+    review_kwargs = adapter._send_message_with_thread_fallback.call_args.kwargs
+    assert review_kwargs["text"] == content
+    assert "**Bản 1:**" in review_kwargs["text"]
+    assert "**Bản 2:**" in review_kwargs["text"]
+    assert "**Bản 3:**" in review_kwargs["text"]
+    assert review_kwargs["reply_markup"] is not None
+
+
 def _make_adapter(extra=None):
     """Create a TelegramAdapter with mocked internals."""
     config = PlatformConfig(enabled=True, token="test-token", extra=extra or {})
